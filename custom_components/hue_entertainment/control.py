@@ -37,6 +37,7 @@ class SyncController:
         self._intensity = _clamp_intensity(intensity)
         self._track_engine_session = track_engine_session
         self._active = False
+        self._closed = False
         self._starting = False
         self._last_error: str | None = None
         self._start_lock = asyncio.Lock()
@@ -141,12 +142,12 @@ class SyncController:
 
     async def async_start(self) -> bool:
         """Start the output once, unless synchronization is disabled."""
-        if not self._enabled or not self.available:
+        if self._closed or not self._enabled or not self.available:
             return False
         if self._active and self._backend.connected:
             return True
         async with self._start_lock:
-            if not self._enabled:
+            if self._closed or not self._enabled:
                 return False
             if self._active and self._backend.connected:
                 return True
@@ -156,7 +157,7 @@ class SyncController:
             self._notify()
             try:
                 await self._backend.async_start()
-                if not self._enabled:
+                if self._closed or not self._enabled:
                     await self._backend.async_stop()
                     return False
                 if self._track_engine_session:
@@ -170,9 +171,16 @@ class SyncController:
                 self._starting = False
                 self._notify()
 
+    @property
+    def output_allowed(self) -> bool:
+        """Check the current gate for immediate and scheduled frame output."""
+        return (
+            not self._closed and self._enabled and self._active and not self._engine.output_suppressed
+        )
+
     def send_frame(self, channels: list[ChannelColor], color_space: int) -> None:
         """Gate and scale a normalized frame before it reaches the backend."""
-        if not self._enabled or not self._active or self._engine.output_suppressed:
+        if not self.output_allowed:
             return
         self._backend.send_frame(
             _scale_channels(channels, color_space, self._intensity), color_space
@@ -203,6 +211,7 @@ class SyncController:
 
     async def async_close(self) -> None:
         """Persist current state and release output resources on unload."""
+        self._closed = True
         await self.async_stop()
         await self._store.async_save(self._saved_state())
         await self._backend.async_close()

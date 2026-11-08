@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 import colorsys
 import logging
-import time
+import math
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from importlib import import_module
 from typing import Any
 
@@ -39,6 +40,9 @@ class EntertainmentOutputBackend(ABC):
 
     @abstractmethod
     async def async_stop(self) -> None: ...
+
+    def clear_pending(self) -> None:
+        """Discard any scheduled output when sync is suppressed."""
 
     async def async_close(self) -> None:
         """Release resources. Backends without resources need no override."""
@@ -123,6 +127,8 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
         channel_map: dict[int, int],
         *,
         fps_cap: int = DEFAULT_STREAM_FPS,
+        smoothing_ms: int = 0,
+        output_allowed: Callable[[], bool] = lambda: True,
         brightness_multiplier: float = 1.0,
         saturation_multiplier: float = 1.0,
     ) -> None:
@@ -135,7 +141,17 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
         self._brightness_multiplier = max(0.0, brightness_multiplier)
         self._saturation_multiplier = max(0.0, saturation_multiplier)
         self._session: Any = None
-        self._last_send = 0.0
+        self._tau = smoothing_ms / 1000
+        self._output_allowed = output_allowed
+        self._targets: dict[int, tuple[int, int, int]] = {}
+        self._values: dict[int, tuple[float, float, float]] = {}
+        self._last_output: dict[int, tuple[int, int, int]] = {}
+        self._last_step: float | None = None
+        self._next_send = 0.0
+        self._last_submission = 0.0
+        self._tick: asyncio.TimerHandle | None = None
+        self._targets_replaced = 0
+        self._target_pending = False
         self._frames_sent = 0
         self._reconnects = 0
         self._restart_required = False
@@ -148,6 +164,7 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
             "area_id": self._area_id,
             "channel_mapping": self.channel_map,
             "frames_sent": self._frames_sent,
+            "targets_replaced": self._targets_replaced,
             "reconnects": self._reconnects,
             "streaming": bool(self._session and self._session.is_streaming),
         }
@@ -160,6 +177,7 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
         async with self._start_lock:
             if self.connected:
                 return
+            self.clear_pending()
             if self._restart_required and self._session is not None:
                 await self._session.aclose()
                 self._session = None
@@ -178,43 +196,110 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
             _LOGGER.debug("Physical Hue Entertainment session started for area %s", self._area_id)
 
     def send_frame(self, channels: list[ChannelColor], color_space: int) -> None:
-        if self._session is None or not self._session.is_streaming:
+        if not self.connected or not self._output_allowed():
+            self.clear_pending()
             return
-        now = time.monotonic()
-        if now - self._last_send < 1 / self._fps_cap:
-            return
-        self._last_send = now
-        commands = []
+
+        now = asyncio.get_running_loop().time()
+        self._advance(now)
+        targets = {}
         for channel in channels:
             physical_channel = self.channel_map.get(channel.channel_id)
             if physical_channel is None:
                 continue
-            red, green, blue = self._adjust(*_as_rgb(channel, color_space))
-            commands.append(
-                LightColorCommand(channel_id=physical_channel, red=red, green=green, blue=blue)
-            )
-        if not commands:
+            rgb = self._adjust(*_as_rgb(channel, color_space))
+            targets[physical_channel] = rgb
+            self._values.setdefault(physical_channel, (float(rgb[0]), float(rgb[1]), float(rgb[2])))
+
+        if not targets:
             return
-        try:
-            self._session.send(commands)
+        if self._target_pending:
+            self._targets_replaced += 1
+        self._target_pending = True
+        self._targets.update(targets)
+        self._schedule_tick(now)
+
+    def _advance(self, now: float) -> None:
+        previous, self._last_step = self._last_step, now
+        if not self._tau or previous is None:
+            return
+        alpha = -math.expm1(-(now - previous) / self._tau)
+
+        def blend(current: float, target: int) -> float:
+            value = current + alpha * (target - current)
+            return float(target) if abs(value - target) < 0.5 else value
+
+        for channel, (red, green, blue) in self._targets.items():
+            r, g, b = self._values[channel]
+            self._values[channel] = blend(r, red), blend(g, green), blend(b, blue)
+
+    def _schedule_tick(self, now: float) -> None:
+        if self._tick is None:
+            self._tick = asyncio.get_running_loop().call_at(
+                max(now, self._next_send), self._send_tick
+            )
+
+    def _send_tick(self) -> None:
+        self._tick = None
+        self._target_pending = False
+        if not self.connected or not self._output_allowed():
+            self.clear_pending()
+            return
+        now = asyncio.get_running_loop().time()
+        self._advance(now)
+        values = self._values if self._tau else self._targets
+        output = {
+            channel: (_wire_component(r), _wire_component(g), _wire_component(b))
+            for channel, (r, g, b) in values.items()
+        }
+        self._next_send = now + 1 / self._fps_cap
+        if output != self._last_output or now - self._last_submission >= 1.0:
+            commands = [
+                LightColorCommand(channel_id=channel, red=r, green=g, blue=b)
+                for channel, (r, g, b) in output.items()
+            ]
+            try:
+                self._session.send(commands)
+            except Exception:
+                self._restart_required = True
+                self.clear_pending()
+                _LOGGER.debug("Hue Entertainment send failed; session will be recreated", exc_info=True)
+                return
+            self._last_submission = now
+            self._last_output = output
             self._frames_sent += 1
-        except Exception:  # recover on the next explicit TV stream start; never block input
-            self._restart_required = True
-            _LOGGER.debug("Hue Entertainment send failed; session will be recreated", exc_info=True)
+        if self._tau and self._values != self._targets:
+            self._schedule_tick(now)
+
+    def clear_pending(self) -> None:
+        """Forget pending colours and reset the filter at session boundaries."""
+        if self._tick is not None:
+            self._tick.cancel()
+            self._tick = None
+        self._target_pending = False
+        self._targets.clear()
+        self._values.clear()
+        self._last_output.clear()
+        self._last_step = None
+        self._next_send = 0.0
 
     async def async_stop(self) -> None:
+        self.clear_pending()
         if self._session is not None:
             await self._session.stop()
             self._restart_required = False
             _LOGGER.debug("Physical Hue Entertainment session stopped")
 
     async def async_close(self) -> None:
+        self.clear_pending()
         if self._session is not None:
             await self._session.aclose()
             self._session = None
             self._restart_required = False
 
     def _adjust(self, red: int, green: int, blue: int) -> tuple[int, int, int]:
+        if self._brightness_multiplier == self._saturation_multiplier == 1.0:
+            return red, green, blue
         hue, saturation, value = colorsys.rgb_to_hsv(red / 65535, green / 65535, blue / 65535)
         adjusted_red, adjusted_green, adjusted_blue = colorsys.hsv_to_rgb(
             hue,
@@ -226,6 +311,13 @@ class HueEntertainmentBackend(EntertainmentOutputBackend):
             round(adjusted_green * 65535),
             round(adjusted_blue * 65535),
         )
+
+
+def _wire_component(value: float) -> int:
+    """Pass an explicit byte to the pinned encoder, including near black."""
+    # 0.1.2 interprets values <= 255 as byte values, and shifts larger values.
+    # Quantize once here to avoid a near-black 255 becoming full intensity.
+    return round(value / 257)
 
 
 def _as_rgb(channel: ChannelColor, color_space: int) -> tuple[int, int, int]:

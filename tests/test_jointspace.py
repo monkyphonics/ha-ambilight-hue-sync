@@ -82,3 +82,36 @@ async def test_initial_topology_failure_retries_before_starting_poll_loop(monkey
     assert source.stats["failed_requests"] == 1
     assert source.stats["reconnects"] == 1
     await source.async_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stall", [False, True])
+async def test_inactivity_uses_last_valid_frame_even_when_poll_does_not_yield_colours(
+    monkeypatch, stall
+) -> None:
+    stopped = asyncio.Event()
+    frames = []
+    source = PhilipsJointSpaceSource(
+        None, "tv", "user", "password", {1: (0.0, 0.0, 0.0)}, frames.append, fps=50
+    )
+
+    async def on_inactivity() -> None:
+        stopped.set()
+
+    async def get(resource):
+        if resource == "ambilight/topology":
+            return {"left": 1}
+        if not frames:
+            return {"layer1": {"left": {"0": {"r": 0, "g": 0, "b": 0}}}}
+        if stall:
+            await asyncio.Future()
+        return {}
+
+    monkeypatch.setattr(source, "_get", get)
+    source.set_inactivity_callback(on_inactivity, 0.1)
+    await source.async_start()
+    try:
+        await asyncio.wait_for(stopped.wait(), timeout=1)
+        assert len(frames) == 1
+    finally:
+        await source.async_close()

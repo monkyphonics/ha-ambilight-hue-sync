@@ -89,7 +89,7 @@ def parse_topology(payload: dict[str, Any]) -> dict[str, int]:
 def measured_points(
     payload: dict[str, Any], topology: dict[str, int], reversed_edges: frozenset[str] = frozenset()
 ) -> list[AmbilightPoint]:
-    """Parse `layer1` measured RGB, ignoring missing/invalid/all-black zones."""
+    """Parse `layer1` measured RGB, ignoring missing or invalid zones."""
     layer = payload.get("layer1")
     if not isinstance(layer, dict):
         return []
@@ -200,7 +200,8 @@ class PhilipsJointSpaceSource(AmbilightSource):
         self._mapping_logged = False
         self._inactivity_callback = None
         self._inactivity_timeout = 5.0
-        self._output_active = False
+        self._inactivity_handle: asyncio.TimerHandle | None = None
+        self._inactivity_task: asyncio.Task | None = None
         self._topology: dict[str, int] = {}
         self._task: asyncio.Task | None = None
         self._running = False
@@ -262,6 +263,12 @@ class PhilipsJointSpaceSource(AmbilightSource):
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._inactivity_handle is not None:
+            self._inactivity_handle.cancel()
+            self._inactivity_handle = None
+        if self._inactivity_task is not None:
+            await self._inactivity_task
+            self._inactivity_task = None
 
     async def async_close(self) -> None:
         await self.async_stop()
@@ -272,6 +279,22 @@ class PhilipsJointSpaceSource(AmbilightSource):
     def set_inactivity_callback(self, callback, timeout: float) -> None:
         """Stop a direct output session when the TV stops yielding valid frames."""
         self._inactivity_callback, self._inactivity_timeout = callback, max(0.1, timeout)
+
+    def _reset_inactivity_timer(self) -> None:
+        if self._inactivity_callback is None:
+            return
+        if self._inactivity_handle is not None:
+            self._inactivity_handle.cancel()
+        self._inactivity_handle = asyncio.get_running_loop().call_later(
+            self._inactivity_timeout, self._on_inactivity
+        )
+
+    def _on_inactivity(self) -> None:
+        self._inactivity_handle = None
+        if self._inactivity_callback is not None and (
+            self._inactivity_task is None or self._inactivity_task.done()
+        ):
+            self._inactivity_task = asyncio.create_task(self._inactivity_callback())
 
     async def _async_topology(self) -> None:
         self._topology = parse_topology(await self._get("ambilight/topology"))
@@ -297,33 +320,15 @@ class PhilipsJointSpaceSource(AmbilightSource):
             if now < next_poll:
                 await asyncio.sleep(next_poll - now)
             started = time.monotonic()
-            next_poll = started + interval
+            next_poll += interval
             try:
                 payload = await self._get("ambilight/measured")
                 points = measured_points(payload, self._topology, self._reversed_edges)
                 colors = map_points_to_channels(
                     points, self._channel_positions, self._manual_mappings
                 )
-                if not colors:
-                    continue
-                if not self._mapping_logged:
-                    for channel_id, position in sorted(self._channel_positions.items()):
-                        mapping = self._manual_mappings.get(channel_id, "auto")
-                        labels = resolved_zone_labels(points, mapping)
-                        _LOGGER.debug(
-                            "Hue channel %d at %s -> %s -> %s",
-                            channel_id,
-                            position,
-                            mapping,
-                            labels or ["auto nearest"],
-                        )
-                    self._mapping_logged = True
-                self._last_frame = time.monotonic()
-                self._frames += 1
-                self._latency_total += self._last_frame - started
-                self._backoff = 0.0
-                self._output_active = True
-                self._frame_callback(colors)
+                if colors:
+                    self._accept_frame(points, colors, started)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 self._failed += 1
                 self._reconnects += 1
@@ -331,16 +336,33 @@ class PhilipsJointSpaceSource(AmbilightSource):
                 if self._failed == 1 or self._failed % 30 == 0:
                     _LOGGER.debug("JointSpace Ambilight poll failed", exc_info=True)
                 await asyncio.sleep(self._backoff)
-            if (
-                self._output_active
-                and time.monotonic() - self._last_frame > self._inactivity_timeout
-            ):
-                self._output_active = False
-                if self._inactivity_callback is not None:
-                    asyncio.create_task(self._inactivity_callback())
-            if time.monotonic() > next_poll:
-                self._skipped += 1
-                next_poll = time.monotonic() + interval
+            now = time.monotonic()
+            if now > next_poll:
+                missed = math.ceil((now - next_poll) / interval)
+                self._skipped += missed
+                next_poll += missed * interval
+
+    def _accept_frame(
+        self, points: list[AmbilightPoint], colors: list[ChannelColor], started: float
+    ) -> None:
+        if not self._mapping_logged:
+            for channel_id, position in sorted(self._channel_positions.items()):
+                mapping = self._manual_mappings.get(channel_id, "auto")
+                labels = resolved_zone_labels(points, mapping)
+                _LOGGER.debug(
+                    "Hue channel %d at %s -> %s -> %s",
+                    channel_id,
+                    position,
+                    mapping,
+                    labels or ["auto nearest"],
+                )
+            self._mapping_logged = True
+        self._last_frame = time.monotonic()
+        self._frames += 1
+        self._latency_total += self._last_frame - started
+        self._backoff = 0.0
+        self._reset_inactivity_timer()
+        self._frame_callback(colors)
 
 
 def _zone_position(edge: str, index: int, count: int, reverse: bool) -> tuple[float, float, float]:

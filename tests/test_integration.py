@@ -1170,11 +1170,12 @@ async def test_performance_only_edit_preserves_other_configuration(
             result["flow_id"], {"management_action": "performance"}
         )
         result = await hass.config_entries.options.async_configure(
-            result["flow_id"], {CONF_TV_POLL_FPS: 12}
+            result["flow_id"], {CONF_TV_POLL_FPS: 12, "colour_smoothing_ms": 60}
         )
 
     effective = _effective_entry_data(entry, result)
     assert effective[CONF_TV_POLL_FPS] == 12
+    assert effective["colour_smoothing_ms"] == 60
     assert effective[CONF_TV_HOST] == entry.data[CONF_TV_HOST]
     assert effective[CONF_TV_USERNAME] == entry.data[CONF_TV_USERNAME]
     assert effective[CONF_TV_PASSWORD] == entry.data[CONF_TV_PASSWORD]

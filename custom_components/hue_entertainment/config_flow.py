@@ -31,6 +31,7 @@ from .const import (
     CONF_BIND_IP,
     CONF_BRIDGE_ID,
     CONF_BRIGHTNESS_MULTIPLIER,
+    CONF_COLOUR_SMOOTHING_MS,
     CONF_HTTP_MODE,
     CONF_HUE_APP_KEY,
     CONF_HUE_AREA_CHANNELS,
@@ -965,6 +966,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Optional(
                         CONF_TV_POLL_FPS, default=self._current(CONF_TV_POLL_FPS, 10)
                     ): vol.Coerce(int),
+                    vol.Optional(
+                        CONF_COLOUR_SMOOTHING_MS,
+                        default=self._current(CONF_COLOUR_SMOOTHING_MS, 0),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=250)),
                     vol.Optional(
                         CONF_BRIGHTNESS_MULTIPLIER,
                         default=self._current(CONF_BRIGHTNESS_MULTIPLIER, 1.0),

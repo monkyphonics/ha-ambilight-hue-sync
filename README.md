@@ -162,6 +162,11 @@ Open **Configure** on the integration card to manage sections independently:
 - Performance, brightness, saturation, and inactivity settings
 - Inherited virtual-bridge and Home Assistant-light options where applicable
 
+For physical Hue output, try **Colour smoothing** at **60 ms** under Performance.
+This is the time to cover about 63% of a colour change. Higher values make fades
+gentler but delay the response to cuts. Set it to **0** to turn smoothing off
+(the default). You can leave the TV polling rate unchanged.
+
 Changing one section preserves unrelated TV and Hue credentials. Opening Configure never starts
 Hue pairing automatically.
 

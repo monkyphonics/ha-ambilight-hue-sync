@@ -38,6 +38,7 @@ from .const import (
     CONF_BIND_IP,
     CONF_BRIDGE_ID,
     CONF_BRIGHTNESS_MULTIPLIER,
+    CONF_COLOUR_SMOOTHING_MS,
     CONF_ENTERTAINMENT_PORT,
     CONF_HTTP_MODE,
     CONF_HUE_APP_KEY,
@@ -84,7 +85,7 @@ from .const import (
 from .control import SyncController
 from .discovery import HueBridgeDiscovery
 from .dtls_psk import DTLSPSKServer
-from .entertainment import EntertainmentEngine, FrameMailbox, LightMapping
+from .entertainment import ChannelColor, EntertainmentEngine, FrameMailbox, LightMapping
 from .ha_http import async_get_http_host, resolve_use_ha_http
 from .hue_api import HueAPIServer
 from .jointspace import PhilipsJointSpaceSource
@@ -137,6 +138,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def _async_handle_pause(call: ServiceCall) -> None:
         for entry in _loaded_entries(hass):
             await entry.runtime_data.engine.async_pause(call.data[ATTR_SECONDS])
+            entry.runtime_data.backend.clear_pending()
 
     async def _async_handle_resume(call: ServiceCall) -> None:
         for entry in _loaded_entries(hass):
@@ -150,6 +152,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             # see docs/pause-release.md.
             entry.runtime_data.api_server.clear_entertainment()
             await entry.runtime_data.engine.async_release(call.data[ATTR_SECONDS])
+            entry.runtime_data.backend.clear_pending()
 
     hass.services.async_register(DOMAIN, SERVICE_PAUSE, _async_handle_pause, _SECONDS_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_RESUME, _async_handle_resume)
@@ -265,6 +268,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: HueEntertainmentConfigEn
             entry.options.get(CONF_HUE_AREA_ID, entry.data.get(CONF_HUE_AREA_ID, "")),
             channel_map,
             fps_cap=int(entry.options.get(CONF_STREAM_FPS, DEFAULT_STREAM_FPS)),
+            smoothing_ms=int(entry.options.get(CONF_COLOUR_SMOOTHING_MS, 0)),
+            output_allowed=lambda: control.output_allowed,
             brightness_multiplier=float(entry.options.get(CONF_BRIGHTNESS_MULTIPLIER, 1.0)),
             saturation_multiplier=float(entry.options.get(CONF_SATURATION_MULTIPLIER, 1.0)),
         )
@@ -303,15 +308,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: HueEntertainmentConfigEn
 
     jointspace_source: PhilipsJointSpaceSource | None = None
 
+    jointspace_start: asyncio.Task | None = None
+    jointspace_target: list[ChannelColor] | None = None
+
     async def _start_jointspace_backend() -> None:
+        nonlocal jointspace_target
         try:
-            await control.async_start()
+            if await control.async_start() and jointspace_target is not None:
+                control.send_frame(jointspace_target, 0)
         except Exception:
             _LOGGER.debug("JointSpace output backend is temporarily unavailable", exc_info=True)
+        finally:
+            jointspace_target = None
 
-    def _jointspace_frame(colors) -> None:
-        hass.async_create_task(_start_jointspace_backend())
-        control.send_frame(colors, 0)
+    async def _stop_jointspace_backend() -> None:
+        nonlocal jointspace_target
+        jointspace_target = None
+        await control.async_stop()
+
+    def _jointspace_frame(colors: list[ChannelColor]) -> None:
+        nonlocal jointspace_start, jointspace_target
+        if not control.enabled or not control.available:
+            return
+        if control.connected:
+            control.send_frame(colors, 0)
+            return
+        jointspace_target = colors
+        if jointspace_start is None or jointspace_start.done():
+            jointspace_start = hass.async_create_task(_start_jointspace_backend())
 
     if input_mode == INPUT_PHILIPS_JOINTSPACE:
         reversed_edges = frozenset(
@@ -346,7 +370,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HueEntertainmentConfigEn
             },
         )
         jointspace_source.set_inactivity_callback(
-            control.async_stop,
+            _stop_jointspace_backend,
             float(
                 entry.options.get(
                     CONF_TV_INACTIVITY_TIMEOUT,
@@ -416,7 +440,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HueEntertainmentConfigEn
         physical-Hue backend stops its native Entertainment session.
         """
         api_server.clear_entertainment()
-        await control.async_stop()
+        await _stop_jointspace_backend()
 
     async def _frame_watchdog() -> None:
         try:
